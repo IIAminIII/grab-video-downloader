@@ -29,8 +29,9 @@ Appears when you hover a video or press play. With one source it downloads immed
 With several, you pick the quality.
 
 **Streams, not just files**<br>
-Downloads HLS (`.m3u8`) streams segment by segment, decrypts AES-128, and merges them
-into one file. Fragmented-MP4 streams save as `.mp4`.
+Downloads HLS (`.m3u8`) streams, including AES-128 encrypted ones. With the helper installed,
+streams are saved as `.mp4` with separate audio tracks merged in. Without it, a built-in
+downloader merges the segments in the browser.
 
 **One-click YouTube & 1000+ sites**<br>
 An optional helper hands the page to [yt-dlp](https://github.com/yt-dlp/yt-dlp), with
@@ -109,8 +110,9 @@ flowchart LR
 2. **Choose.** The floating button or the popup sends a request to the job manager.
 3. **Download** with the right engine:
    - **Direct files** go to `chrome.downloads`.
-   - **HLS** goes to a hidden offscreen document. It fetches segments 6 at a time with retries,
-     decrypts AES-128, and joins them into one file.
+   - **HLS** goes to yt-dlp when the helper is installed (merges audio tracks, writes straight to disk,
+     saves `.mp4`). Otherwise, or if yt-dlp can't fetch the stream, a hidden offscreen document fetches
+     segments 6 at a time with retries, decrypts AES-128, and joins them into one file.
    - **Everything else** goes to the native helper, which runs yt-dlp and streams progress back to the extension.
 
 <details>
@@ -132,7 +134,8 @@ flowchart LR
 
 ## Limitations
 - **DRM-protected streams** (Netflix, Prime Video, Disney+, …) can't be downloaded, by design.
-- **HLS downloads are held in memory** until saved, so very long streams need a lot of RAM.
+- **Without the helper**, HLS downloads are held in memory until saved (very long streams need a lot of RAM),
+  streams with a separate audio track save without sound, and most streams save as `.ts`.
 - **DASH (`.mpd`) streams** are handed to yt-dlp, so they need the helper.
 - The helper installer is **Windows-only** for now. `host.js` itself is cross-platform.
 
@@ -159,6 +162,12 @@ and so are YouTube feed previews.
 Some sites sign their URLs or check cookies more strictly. Use **Try yt-dlp on this page**, which knows
 the quirks of many sites.
 </details>
+
+## Security
+- Requests from web pages are limited to listing, starting and cancelling downloads for their own tab.
+- Only `http(s)` addresses are downloaded, and saved files always get a known media extension,
+  never one chosen by the server.
+- The helper validates everything it receives before it reaches the yt-dlp command line.
 
 ## Responsible use
 Only download content you own or have permission to download. Many sites' terms of service forbid
