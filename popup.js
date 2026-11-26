@@ -200,7 +200,9 @@ function renderHelper() {
 // ---------- boot ----------
 
 async function main() {
-  [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  // popup.html?tab=<id> shows another tab's media (handy for debugging / opening the popup as a page)
+  const forced = Number(new URLSearchParams(location.search).get('tab'));
+  [tab] = forced ? [await chrome.tabs.get(forced)] : await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab) return;
   $('#page').textContent = tab.title || tab.url || '';
 

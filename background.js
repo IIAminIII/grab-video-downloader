@@ -206,7 +206,8 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
         await clearTab(tabId);
         return reply({ ok: true });
       case 'start': {
-        const tab = sender.tab || (tabId != null ? await chrome.tabs.get(tabId).catch(() => null) : null);
+        // an explicit tabId (popup) wins over the sender's own tab (content script / popup opened as a page)
+        const tab = (msg.tabId != null ? await chrome.tabs.get(msg.tabId).catch(() => null) : null) || sender.tab || null;
         const id = await startJob({
           item: msg.item,
           variantUrl: msg.variantUrl,
