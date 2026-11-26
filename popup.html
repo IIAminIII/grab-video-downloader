@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Grab</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <img src="icons/icon32.png" alt="" width="20" height="20">
+      <span>Grab</span>
+    </div>
+    <button id="clear" class="ghost" title="Clear the detected list for this tab">Clear</button>
+  </header>
+
+  <section id="jobsSection" hidden>
+    <div class="section-head">
+      <h2>Downloads</h2>
+      <button id="clearJobs" class="link">Clear finished</button>
+    </div>
+    <ul id="jobs"></ul>
+  </section>
+
+  <section>
+    <div class="section-head"><h2>On this page</h2></div>
+    <p id="page" class="page"></p>
+    <ul id="list"></ul>
+    <div id="empty" class="empty" hidden>
+      <strong>No media found yet</strong>
+      <p>Play the video on the page, then open this popup again.</p>
+    </div>
+  </section>
+
+  <footer>
+    <button id="pageDl" class="ghost wide">Download this page with yt-dlp</button>
+    <p id="helperNote" class="hint" hidden></p>
+  </footer>
+
+  <script src="popup.js" type="module"></script>
+</body>
+</html>

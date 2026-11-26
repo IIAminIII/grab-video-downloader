@@ -1,0 +1,52 @@
+{
+  "manifest_version": 3,
+  "name": "Grab – Video Downloader",
+  "version": "2.0.0",
+  "description": "Detects videos and audio on any page and downloads them, including HLS (.m3u8) streams.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzXVrAJH2/6y9Da6W5aUyJMAmtjA/SDVRl4dwsq9gOwkk30CV8xcO0SwZN3UMGS2ct015joPAF19eDXA4LLH+LIouKJum5S5xacMJVQfUklj9OQ3Op+bi0GTqZWZFIUg9m/TTBd0KgAVW3As38/vicp7fb4jtgNjXMWhn9NIX3kOEqbhQ0NnEeGi/x4aHg9C08S55uzkFK5xxjCceDve5u5VwpPEej1Z4sJFlVCYu4S4m4QSCqykgx0fqcIyRNGc8B7f4yCKP9zlQg17Jhf7BCU8z2XDeD1Iwx37l4tRT71zim4YsTH9apq+wKxTIf2Ayed3HjKhrd3coZ7z+K3N4PwIDAQAB",
+  "permissions": [
+    "webRequest",
+    "downloads",
+    "storage",
+    "declarativeNetRequestWithHostAccess",
+    "offscreen",
+    "nativeMessaging",
+    "notifications"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Grab – media on this page",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "all_frames": true,
+      "match_about_blank": true,
+      "run_at": "document_idle"
+    }
+  ]
+}
