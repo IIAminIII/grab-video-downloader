@@ -108,6 +108,13 @@ export function safeName(name) {
     .slice(0, 120) || 'video';
 }
 
+/** The only extensions a direct download may be saved with. Never trust a page-supplied one. */
+export const MEDIA_EXT = new Set(['mp4', 'webm', 'mkv', 'mov', 'm4v', 'flv', 'mpg', 'ts',
+  'mp3', 'm4a', 'aac', 'ogg', 'oga', 'opus', 'wav', 'flac']);
+const safeExt = ext => (MEDIA_EXT.has(String(ext || '').toLowerCase()) ? String(ext).toLowerCase() : 'mp4');
+
+const isHttp = u => { try { return /^https?:$/.test(new URL(u).protocol); } catch { return false; } };
+
 // ---------- engine: chrome.downloads (direct files + finished HLS blobs) ----------
 
 let pollTimer = null;
@@ -149,7 +156,7 @@ chrome.downloads.onChanged.addListener(async delta => {
 async function startFile(job, item) {
   const downloadId = await chrome.downloads.download({
     url: item.url,
-    filename: `${safeName(job.title)}.${item.ext || 'mp4'}`,
+    filename: `${safeName(job.title)}.${safeExt(item.ext)}`,
     conflictAction: 'uniquify',
   });
   await update(job.id, { status: 'downloading', downloadId });
@@ -172,32 +179,51 @@ function offscreenSend(msg) {
   return chrome.runtime.sendMessage({ target: 'offscreen', ...msg }).catch(() => {});
 }
 
-// Referer/Origin header rules for offscreen fetches (tabId -1). Rule ids are per job.
-const ruleIds = new Map(); // job id -> numeric rule id
-let nextRule = 5000;
+// Referer/Origin header rules for the offscreen downloader's fetches.
+// Each job owns two rule ids (job.ruleId and +1), stored on the job so they survive worker restarts:
+//   ruleId     same host as the page  -> full page URL as Referer (what the browser itself would send)
+//   ruleId + 1 other hosts (CDNs)     -> only the page's origin, so the full URL isn't leaked
+// Rules match only requests made by this extension outside any tab.
+const RULE_BASE = 5000;
+let nextRule = RULE_BASE;
 async function setRule(jobId, ref, hosts) {
-  if (!ref || !hosts.length) return;
-  let origin;
-  try { origin = new URL(ref).origin; } catch { return; }
-  if (!ruleIds.has(jobId)) ruleIds.set(jobId, nextRule++);
-  const id = ruleIds.get(jobId);
-  await chrome.declarativeNetRequest.updateSessionRules({
-    removeRuleIds: [id],
-    addRules: [{
-      id, priority: 1,
-      action: { type: 'modifyHeaders', requestHeaders: [
-        { header: 'Referer', operation: 'set', value: ref },
-        { header: 'Origin', operation: 'set', value: origin },
-      ] },
-      condition: { tabIds: [chrome.tabs.TAB_ID_NONE], requestDomains: hosts, resourceTypes: ['xmlhttprequest'] },
-    }],
+  await load();
+  const job = jobs.get(jobId);
+  if (!job || !isActive(job) || !isHttp(ref) || !Array.isArray(hosts)) return;
+  const page = new URL(ref);
+  hosts = [...new Set(hosts.filter(h => typeof h === 'string' && /^[a-z0-9.-]+$/i.test(h)))].slice(0, 50);
+  if (!hosts.length) return;
+
+  if (job.ruleId == null) {
+    const existing = await chrome.declarativeNetRequest.getSessionRules();
+    nextRule = Math.max(nextRule, ...existing.map(r => r.id + 1));
+    job.ruleId = nextRule;
+    nextRule += 2;
+    persist();
+  }
+  const rule = (id, requestDomains, referer) => ({
+    id, priority: 1,
+    action: { type: 'modifyHeaders', requestHeaders: [
+      { header: 'Referer', operation: 'set', value: referer },
+      { header: 'Origin', operation: 'set', value: page.origin },
+    ] },
+    condition: {
+      initiatorDomains: [chrome.runtime.id],
+      tabIds: [chrome.tabs.TAB_ID_NONE],
+      requestDomains,
+      resourceTypes: ['xmlhttprequest'],
+    },
   });
+  const same = hosts.filter(h => h === page.hostname);
+  const other = hosts.filter(h => h !== page.hostname);
+  const addRules = [];
+  if (same.length) addRules.push(rule(job.ruleId, same, page.href));
+  if (other.length) addRules.push(rule(job.ruleId + 1, other, page.origin + '/'));
+  await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [job.ruleId, job.ruleId + 1], addRules });
 }
 function removeRule(job) {
-  const id = ruleIds.get(job.id);
-  if (id == null) return;
-  ruleIds.delete(job.id);
-  chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [id] }).catch(() => {});
+  if (job.ruleId == null) return;
+  chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [job.ruleId, job.ruleId + 1] }).catch(() => {});
 }
 
 async function startHls(job, item, variantUrl) {
@@ -209,7 +235,7 @@ async function startHls(job, item, variantUrl) {
 /** Messages coming back from the offscreen document. Returns true if handled. */
 export async function handleOffscreen(msg) {
   switch (msg.type) {
-    case 'hls-rule': { await load(); const j = jobs.get(msg.id); await setRule(msg.id, msg.ref || j?.pageUrl, msg.hosts); return true; }
+    case 'hls-rule': { await load(); const j = jobs.get(msg.id); await setRule(msg.id, j?.pageUrl, msg.hosts); return true; }
     case 'hls-info':
       update(msg.id, { label: [msg.height ? `${msg.height}p` : '', `${msg.segments} segments`, msg.live ? 'live' : ''].filter(Boolean).join(' · ') }, true);
       return true;
@@ -219,10 +245,16 @@ export async function handleOffscreen(msg) {
     case 'hls-ready': {
       const job = await update(msg.id, { status: 'saving', progress: 1, bytes: msg.size }, true);
       if (!job) return true;
+      // only a blob created by this extension, and only the two extensions the merger produces
+      if (typeof msg.blobUrl !== 'string' || !msg.blobUrl.startsWith(`blob:${chrome.runtime.getURL('')}`)) {
+        update(msg.id, { status: 'error', error: 'Internal error: unexpected file source' }, true);
+        return true;
+      }
+      const ext = msg.ext === 'mp4' ? 'mp4' : 'ts';
       const downloadId = await chrome.downloads.download({
-        url: msg.blobUrl, filename: `${safeName(job.title)}.${msg.ext}`, conflictAction: 'uniquify',
+        url: msg.blobUrl, filename: `${safeName(job.title)}.${ext}`, conflictAction: 'uniquify',
       });
-      update(msg.id, { downloadId, ext: msg.ext });
+      update(msg.id, { downloadId, ext });
       return true;
     }
     case 'hls-error': update(msg.id, { status: 'error', error: msg.error }, true); return true;
@@ -252,7 +284,11 @@ function connect() {
     helper = { checked: true, ok: false, error: err };
     while (helloWaiters.length) helloWaiters.shift()(helper);
     await load();
-    for (const j of jobs.values()) if (j.kind === 'ytdlp' && isActive(j)) update(j.id, { status: 'error', error: 'Helper stopped: ' + err }, true);
+    for (const j of [...jobs.values()]) {
+      if (j.kind !== 'ytdlp' || !isActive(j)) continue;
+      if (j.fallback) fallbackToBuiltin(j, err);
+      else update(j.id, { status: 'error', error: 'Helper stopped: ' + err }, true);
+    }
   });
   return port;
 }
@@ -278,8 +314,25 @@ export function helperStatus() {
   });
 }
 
+/** Cached helper status (re-checked at most once a minute), so starting a job stays fast. */
+let helperAt = 0;
+async function getHelper() {
+  if (helper.checked && helper.ok && Date.now() - helperAt < 60000) return helper;
+  return helperStatus();
+}
+
+/** yt-dlp could not handle a stream (cookies, odd playlist...): continue with the built-in downloader. */
+async function fallbackToBuiltin(job, why) {
+  const fb = job.fallback;
+  console.warn(`Grab: yt-dlp failed for "${job.title}" (${why}); using the built-in stream downloader`);
+  await update(job.id, { kind: 'hls', fallback: null, status: 'downloading', progress: 0, bytes: 0, total: 0, speed: null }, true);
+  try { await startHls(job, { url: fb.url }, fb.variantUrl); }
+  catch (e) { update(job.id, { status: 'error', error: String(e.message || e) }, true); }
+}
+
 async function onNative(msg) {
   if (msg.type === 'hello') {
+    helperAt = Date.now();
     helper = { checked: true, ok: !!msg.ytdlp, ytdlp: msg.ytdlp, ffmpeg: msg.ffmpeg, dir: msg.dir,
                error: msg.ytdlp ? null : 'yt-dlp is not installed (winget install yt-dlp.yt-dlp)' };
     while (helloWaiters.length) helloWaiters.shift()(helper);
@@ -295,20 +348,30 @@ async function onNative(msg) {
                        bytes: msg.bytes, total: msg.total || 0, speed: msg.speed });
       break;
     case 'done': update(msg.id, { status: 'done', progress: 1, filePath: msg.filePath }, true); break;
-    case 'error': update(msg.id, { status: 'error', error: msg.error }, true); break;
+    case 'error': {
+      await load();
+      const j = jobs.get(msg.id);
+      if (j?.fallback && isActive(j)) fallbackToBuiltin(j, msg.error);
+      else update(msg.id, { status: 'error', error: msg.error }, true);
+      break;
+    }
     case 'cancelled': update(msg.id, { status: 'cancelled' }, true); break;
   }
 }
 
-async function startYtdlp(job, url) {
-  const h = helper.ok ? helper : await helperStatus();
+/** stream: null for a normal yt-dlp job, or { height } when a detected HLS stream is handed to yt-dlp. */
+async function startYtdlp(job, url, stream = null) {
+  const h = await getHelper();
   if (!h.ok) {
+    if (job.fallback) return fallbackToBuiltin(job, 'helper not available');
     await update(job.id, { status: 'error', error: 'Helper not installed. Run native-host\\install.ps1 once.', needsHelper: true }, true);
     return;
   }
   clearTimeout(idleTimer);
   await update(job.id, { status: 'downloading' });
-  connect().postMessage({ type: 'download', id: job.id, url, referer: job.pageUrl || undefined });
+  const msg = { type: 'download', id: job.id, url, referer: job.pageUrl || undefined };
+  if (stream) Object.assign(msg, { mode: 'stream', title: job.title, height: stream.height || undefined, userAgent: navigator.userAgent });
+  connect().postMessage(msg);
 }
 
 // ---------- public API ----------
@@ -319,29 +382,50 @@ async function startYtdlp(job, url) {
  */
 export async function startJob(req) {
   const { item } = req;
-  const engine = item.kind === 'file' ? 'file' : item.kind === 'hls' ? 'hls' : 'ytdlp';
+  // Requests can come from content scripts, i.e. from inside web pages: accept web URLs only.
+  if (!item || !isHttp(item.url)) throw new Error('Not a downloadable web address');
+  if (req.variantUrl && !isHttp(req.variantUrl)) throw new Error('Not a downloadable web address');
+
+  let engine = item.kind === 'file' ? 'file' : item.kind === 'hls' ? 'hls' : 'ytdlp';
+
+  // Streams go to yt-dlp + ffmpeg when the helper is there: it merges separate audio tracks, writes
+  // straight to disk (no memory limit) and produces .mp4. Live streams and anything yt-dlp can't
+  // fetch (it has no browser cookies) fall back to the built-in downloader.
+  let stream = null;
+  if (item.kind === 'hls' && !item.hls?.live) {
+    const h = await getHelper();
+    if (h.ok && h.ffmpeg) {
+      const v = Array.isArray(item.hls?.variants) ? item.hls.variants.find(x => x.url === req.variantUrl) : null;
+      stream = { height: Number.isInteger(v?.height) && v.height > 0 ? v.height : null };
+      engine = 'ytdlp';
+    }
+  }
+
   const job = await create({
     kind: engine,
     tabId: req.tabId ?? -1,
-    title: req.title || 'video',
-    pageUrl: req.pageUrl || '',
+    title: String(req.title || 'video').slice(0, 300),
+    pageUrl: isHttp(req.pageUrl) ? req.pageUrl : '',
     sourceUrl: item.url,
-    label: req.label || '',
+    label: String(req.label || '').slice(0, 40),
+    fallback: stream ? { url: item.url, variantUrl: req.variantUrl || '' } : null,
   });
   try {
     if (engine === 'file') await startFile(job, item);
     else if (engine === 'hls') await startHls(job, item, req.variantUrl);
-    else await startYtdlp(job, item.url); // youtube watch URL, or the page/frame URL for 'page' and 'dash'
+    else await startYtdlp(job, item.url, stream); // YouTube watch URL, a page/frame URL, or a stream playlist
   } catch (e) {
     await update(job.id, { status: 'error', error: String(e.message || e) }, true);
   }
   return job.id;
 }
 
-export async function cancelJob(id) {
+/** onlyTabId: when the request comes from a content script, it may cancel only its own tab's jobs. */
+export async function cancelJob(id, onlyTabId = null) {
   await load();
   const j = jobs.get(id);
   if (!j || !isActive(j)) return;
+  if (onlyTabId != null && j.tabId !== onlyTabId) return;
   if (j.kind === 'file' && j.downloadId != null) chrome.downloads.cancel(j.downloadId);
   else if (j.kind === 'hls') {
     if (j.downloadId != null) chrome.downloads.cancel(j.downloadId);

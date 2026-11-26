@@ -234,7 +234,7 @@
             opts.push({ title: q, sub: `Stream${v.bandwidth ? ` · ${(v.bandwidth / 1e6).toFixed(1)} Mbps` : ''}`, item: it, variantUrl: v.url, label: q });
           }
         } else {
-          opts.push({ title: 'Stream', sub: [fmtDur(h?.duration), h?.fmp4 ? 'MP4' : 'TS'].filter(Boolean).join(' · ') || 'HLS', item: it });
+          opts.push({ title: 'Stream', sub: fmtDur(h?.duration) || 'HLS', item: it });
         }
       } else if (it.kind === 'dash') {
         opts.push({ title: 'DASH stream', sub: 'Downloaded with yt-dlp', item: { kind: 'page', url: location.href } });

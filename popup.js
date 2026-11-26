@@ -159,7 +159,8 @@ function renderItems(items) {
         metaBits.push(`${h.variants.length} qualities`);
       } else {
         if (h.duration) metaBits.push(fmtDuration(h.duration));
-        metaBits.push(h.fmp4 ? 'saves as .mp4' : 'saves as .ts');
+        // with the helper, streams are remuxed to .mp4 by yt-dlp/ffmpeg (live streams use the built-in downloader)
+        metaBits.push(h.fmp4 || (helper?.ok && helper.ffmpeg && !h.live) ? 'saves as .mp4' : 'saves as .ts');
         if (h.encryption === 'aes-128') metaBits.push('encrypted (ok)');
         if (h.encryption === 'drm') { note = el('div', { className: 'note', textContent: 'DRM-protected: cannot be downloaded.' }); disabled = true; }
         else if (h.live) note = el('div', { className: 'note', textContent: 'Live stream: only the part available now is saved.' });

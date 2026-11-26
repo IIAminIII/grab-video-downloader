@@ -89,26 +89,89 @@ const jobs = new Map(); // id -> child process
 
 function num(s) { const n = Number(s); return Number.isFinite(n) ? n : null; }
 
-function download({ id, url, referer, dir }) {
+/** Normalized http(s) URL, or null. A normalized URL always starts with "http", never with "-". */
+function httpUrl(u) {
+  try {
+    const x = new URL(String(u));
+    return /^https?:$/.test(x.protocol) ? x.href : null;
+  } catch { return null; }
+}
+
+/** File-name-safe title. "%" is dropped because the name becomes a yt-dlp output template. */
+function cleanTitle(t) {
+  return String(t || '')
+    .replace(/[\\/:*?"<>|%\u0000-\u001f]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/^[.\s-]+|[.\s]+$/g, '')
+    .slice(0, 120) || 'video';
+}
+
+/** First "<base>", "<base> (1)", ... for which no .mp4 exists yet. */
+function freeBase(dir, base) {
+  for (let i = 0; i < 1000; i++) {
+    const name = i ? `${base} (${i})` : base;
+    if (!fs.existsSync(path.join(dir, `${name}.mp4`))) return name;
+  }
+  return `${base} ${Date.now()}`;
+}
+
+/** Remove yt-dlp's leftovers (.part, .ytdl, fragments) after a failed or cancelled stream download. */
+function cleanPartials(dir, base) {
+  try {
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.startsWith(base + '.')) continue;
+      if (/\.(part|ytdl)$/.test(f) || /\.part-Frag\d+/.test(f) || /\.f[\w-]+\.\w+$/.test(f)) {
+        try { fs.unlinkSync(path.join(dir, f)); } catch {}
+      }
+    }
+  } catch {}
+}
+
+/**
+ * msg: { id, url, referer?, mode?, title?, height?, userAgent? }
+ * mode 'stream': url is an HLS playlist found by the extension; saved as "<title>.mp4".
+ * Every field arrives from the browser, so each one is validated before it reaches the command line.
+ */
+function download(msg) {
+  const { id } = msg;
   const { ytdlp, ffmpeg } = getTools();
   if (!ytdlp) return send({ type: 'error', id, error: 'yt-dlp not found. Install it with: winget install yt-dlp.yt-dlp' });
 
-  const outDir = dir || DEFAULT_DIR;
+  const url = httpUrl(msg.url);
+  if (!url) return send({ type: 'error', id, error: 'Not a downloadable web address' });
+  const page = httpUrl(msg.referer);
+  const stream = msg.mode === 'stream';
+  const maxHeight = Number.isInteger(msg.height) && msg.height > 0 && msg.height < 20000 ? msg.height : null;
+  const userAgent = typeof msg.userAgent === 'string' && /^[\x20-\x7e]{1,300}$/.test(msg.userAgent) ? msg.userAgent : null;
+
+  const outDir = process.env.GRAB_DOWNLOAD_DIR || DEFAULT_DIR; // env override is for tests only
+  const base = stream ? freeBase(outDir, cleanTitle(msg.title)) : null;
+
   const args = [
     '--newline', '--no-colors', '--no-playlist', '--quiet', '--progress',
     '-f', 'bv*+ba/b',
-    '-S', 'res,vcodec:h264,acodec:m4a', // best resolution; prefer H.264/AAC (plays everywhere) when equal
+    // best resolution (capped at the chosen quality for streams); prefer H.264/AAC, which plays everywhere
+    '-S', `${maxHeight ? `res:${maxHeight}` : 'res'},vcodec:h264,acodec:m4a`,
     '--merge-output-format', 'mp4',
     '-P', outDir,
-    '-o', '%(title).150B [%(id)s].%(ext)s',
+    '-o', stream ? `${base}.%(ext)s` : '%(title).150B [%(id)s].%(ext)s',
     '--js-runtimes', `node:${process.execPath}`,
     '--progress-template', 'download:GRABPROG %(progress.downloaded_bytes)s %(progress.total_bytes)s %(progress.total_bytes_estimate)s %(progress.speed)s %(progress.eta)s',
     '--print', 'before_dl:GRABINFO %(format_id)s|%(height)s|%(title)s',
     '--print', 'after_move:GRABFILE %(filepath)s',
   ];
   if (ffmpeg) args.push('--ffmpeg-location', path.dirname(ffmpeg));
-  if (referer) args.push('--referer', referer);
-  args.push(url);
+  if (page) {
+    // like a browser: full page URL to the page's own host, only the origin to other hosts
+    const p = new URL(page);
+    args.push('--referer', new URL(url).hostname === p.hostname ? page : p.origin + '/');
+    if (stream) args.push('--add-headers', `Origin:${p.origin}`);
+  }
+  if (stream) {
+    args.push('--concurrent-fragments', '4', '--remux-video', 'mp4');
+    if (userAgent) args.push('--user-agent', userAgent);
+  }
+  args.push('--', url); // "--" ends option parsing: the URL can never be read as an option
 
   const child = spawn(ytdlp, args, {
     windowsHide: true,
@@ -125,7 +188,7 @@ function download({ id, url, referer, dir }) {
       const [fmt, h, ...t] = line.slice(9).split('|');
       parts = fmt.split('+').length;
       height = num(h);
-      title = t.join('|');
+      title = stream ? base : t.join('|'); // a raw playlist has no real title; keep the page's
       send({ type: 'info', id, title, height, parts });
     } else if (line.startsWith('GRABPROG ')) {
       const [done, total, est, speed, eta] = line.slice(9).split(' ').map(num);
@@ -163,8 +226,10 @@ function download({ id, url, referer, dir }) {
 
   child.on('close', code => {
     jobs.delete(id);
+    const ok = code === 0 && filePath;
+    if (stream && !ok) cleanPartials(outDir, base);
     if (child.cancelled) send({ type: 'cancelled', id });
-    else if (code === 0 && filePath) send({ type: 'done', id, filePath, title, height });
+    else if (ok) send({ type: 'done', id, filePath, title, height });
     else {
       const err = [...errLines].reverse().find(l => l.startsWith('ERROR')) || errLines.at(-1) || `yt-dlp exited with code ${code}`;
       send({ type: 'error', id, error: err.replace(/^ERROR:\s*/, '') });

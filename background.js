@@ -3,7 +3,7 @@
 // and routes download requests to the job manager (jobs.js).
 
 import { parsePlaylist } from './hls.js';
-import { startJob, cancelJob, reveal, listJobs, clearFinished, helperStatus, handleOffscreen } from './jobs.js';
+import { startJob, cancelJob, reveal, listJobs, clearFinished, helperStatus, handleOffscreen, MEDIA_EXT } from './jobs.js';
 
 const MIN_FILE_SIZE = 200 * 1024; // ignore direct files smaller than 200 KB (ads, previews)
 
@@ -94,11 +94,22 @@ function classify(details) {
   return null;
 }
 
+// Content-Type subtype -> file extension. Anything not listed falls back to a generic media
+// extension: the server must never get to pick the saved file's extension (think "video/exe").
+const CT_EXT = {
+  mp4: 'mp4', webm: 'webm', 'x-matroska': 'mkv', quicktime: 'mov', 'x-flv': 'flv', 'x-m4v': 'm4v',
+  mp3: 'mp3', 'x-m4a': 'm4a', aac: 'aac', ogg: 'ogg', opus: 'opus', wav: 'wav', 'x-wav': 'wav',
+  flac: 'flac', 'x-flac': 'flac',
+};
 function extFrom(url, ct) {
   const m = url.match(FILE_RE);
   if (m) return m[1].toLowerCase();
-  const sub = (ct.split('/')[1] || '').split(';')[0].trim();
-  return { mpeg: 'mp3', 'x-matroska': 'mkv', quicktime: 'mov', 'x-flv': 'flv' }[sub] || sub || 'mp4';
+  const [type = '', sub = ''] = ct.split(';')[0].trim().split('/');
+  const audio = type === 'audio';
+  let ext = CT_EXT[sub];
+  if (sub === 'mpeg') ext = audio ? 'mp3' : 'mpg';
+  if (sub === 'mp4' && audio) ext = 'm4a';
+  return MEDIA_EXT.has(ext) ? ext : (audio ? 'mp3' : 'mp4');
 }
 
 chrome.webRequest.onHeadersReceived.addListener(
@@ -186,16 +197,30 @@ async function inspectPlaylist(tabId, url) {
 
 // ---------- messages from popup / floating button / offscreen ----------
 
+const EXT_ORIGIN = chrome.runtime.getURL('');
+const OFFSCREEN_URL = chrome.runtime.getURL('offscreen.html');
+const deny = reply => { reply({ ok: false, error: 'forbidden' }); return false; };
+
 chrome.runtime.onMessage.addListener((msg, sender, reply) => {
-  if (!msg || msg.target === 'offscreen' || msg.type === 'job') return false;
+  if (!msg || typeof msg.type !== 'string' || msg.target === 'offscreen' || msg.type === 'job') return false;
+  if (sender.id !== chrome.runtime.id) return false;
+
+  // Who is asking? Extension pages (popup, offscreen) are trusted. Content scripts run inside
+  // web pages, so they may only list/start/cancel for their own tab.
+  const fromPage = !!sender.url?.startsWith(EXT_ORIGIN);
 
   if (msg.type.startsWith('hls-')) {
+    if (sender.url !== OFFSCREEN_URL || sender.tab) return deny(reply); // only the offscreen downloader
     handleOffscreen(msg).then(() => reply({ ok: true }), e => reply({ ok: false, error: String(e) }));
     return true;
   }
 
+  const PAGE_ONLY = new Set(['clear', 'jobs', 'reveal', 'clearJobs', 'helper']);
+  if (!fromPage && PAGE_ONLY.has(msg.type)) return deny(reply);
+  if (!fromPage && !sender.tab) return deny(reply);
+
   (async () => {
-    const tabId = msg.tabId ?? sender.tab?.id;
+    const tabId = fromPage ? (msg.tabId ?? sender.tab?.id) : sender.tab.id;
     switch (msg.type) {
       case 'list': {
         const key = keyFor(tabId);
@@ -206,20 +231,22 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
         await clearTab(tabId);
         return reply({ ok: true });
       case 'start': {
-        // an explicit tabId (popup) wins over the sender's own tab (content script / popup opened as a page)
-        const tab = (msg.tabId != null ? await chrome.tabs.get(msg.tabId).catch(() => null) : null) || sender.tab || null;
+        // popup: an explicit tabId wins. Content script: always its own tab, title and URL.
+        const tab = fromPage
+          ? ((msg.tabId != null ? await chrome.tabs.get(msg.tabId).catch(() => null) : null) || sender.tab || null)
+          : sender.tab;
         const id = await startJob({
           item: msg.item,
           variantUrl: msg.variantUrl,
           label: msg.label,
           tabId: tab?.id ?? -1,
-          title: msg.title || tab?.title,
-          pageUrl: msg.pageUrl || tab?.url,
+          title: (fromPage && msg.title) || tab?.title,
+          pageUrl: (fromPage && msg.pageUrl) || tab?.url,
         });
         return reply({ ok: true, id });
       }
       case 'jobs': return reply({ jobs: await listJobs() });
-      case 'cancel': await cancelJob(msg.id); return reply({ ok: true });
+      case 'cancel': await cancelJob(msg.id, fromPage ? null : sender.tab.id); return reply({ ok: true });
       case 'reveal': await reveal(msg.id); return reply({ ok: true });
       case 'clearJobs': await clearFinished(); return reply({ ok: true });
       case 'helper': return reply(await helperStatus());
